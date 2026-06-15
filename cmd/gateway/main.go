@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.bug.st/serial"
+	"thermal-recovery-flow/internal/choke"
 	"thermal-recovery-flow/internal/config"
 	"thermal-recovery-flow/internal/driftflux"
 	"thermal-recovery-flow/internal/frame"
@@ -22,15 +23,16 @@ import (
 )
 
 type GatewayApp struct {
-	cfg         *config.Config
-	logger      *logger.Logger
-	tcpGateway  *gateway.TCPGateway
-	serialGW    *gateway.SerialGateway
-	pipeline    *pipeline.Pipeline
-	solver      *driftflux.DriftFluxSolver
-	frameOut    *frame.FrameOutput
-	statsTicker *time.Ticker
-	shutdown    atomic.Bool
+	cfg               *config.Config
+	logger            *logger.Logger
+	tcpGateway        *gateway.TCPGateway
+	serialGW          *gateway.SerialGateway
+	pipeline          *pipeline.Pipeline
+	solver            *driftflux.DriftFluxSolver
+	frameOut          *frame.FrameOutput
+	chokeInterceptor  *choke.ChokeInterceptor
+	statsTicker       *time.Ticker
+	shutdown          atomic.Bool
 }
 
 var (
@@ -126,6 +128,20 @@ func (app *GatewayApp) init() error {
 	}
 	app.frameOut = frame.NewFrameOutput(outputCfg, frameChan, app.logger)
 
+	chokeChan := make(chan *choke.ChokeFrame, app.cfg.Solver.ChannelSize)
+	chokeConfig := choke.DefaultChokeInterceptorConfig()
+	chokeConfig.Enabled = app.cfg.Choke.Enabled
+	chokeConfig.ControllerConfig.SafetyPressureLimit = app.cfg.Choke.SafetyPressureLimit
+	chokeConfig.ControllerConfig.OverrideAddress = uint8(app.cfg.Choke.OverrideSlaveAddr)
+	chokeConfig.ControllerConfig.OverrideRegister = uint16(app.cfg.Choke.OverrideRegister)
+	chokeConfig.DownstreamPressure = app.cfg.Choke.DownstreamPressure
+	chokeConfig.SenderConfig.TargetAddr = app.cfg.Choke.OverrideTargetAddr
+	app.chokeInterceptor = choke.NewChokeInterceptor(chokeConfig, frameChan, chokeChan, app.logger)
+
+	safety.SafeGo(app.logger, "app.chokeMonitor", func() {
+		app.chokeMonitor(chokeChan)
+	})
+
 	if app.cfg.TCP.Enabled {
 		app.tcpGateway = gateway.NewTCPGateway(app.cfg.TCP.ListenAddr, app.pipeline.Input(), app.logger)
 		if app.cfg.TCP.MaxConnections > 0 {
@@ -182,6 +198,10 @@ func (app *GatewayApp) start() error {
 
 	app.pipeline.Start()
 	app.solver.Start()
+
+	if app.chokeInterceptor != nil {
+		app.chokeInterceptor.Start()
+	}
 
 	if app.cfg.TCP.Enabled && app.tcpGateway != nil {
 		if err := app.tcpGateway.Start(); err != nil {
@@ -255,6 +275,17 @@ func (app *GatewayApp) stop() {
 		}()
 	}
 
+	if app.chokeInterceptor != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during choke interceptor stop: %v", r)
+				}
+			}()
+			app.chokeInterceptor.Stop()
+		}()
+	}
+
 	if app.solver != nil {
 		func() {
 			defer func() {
@@ -288,6 +319,28 @@ func (app *GatewayApp) handleErrors(errChan <-chan error) {
 	for err := range errChan {
 		if err != nil {
 			app.logger.Debug("Processing error: %v", err)
+		}
+	}
+}
+
+func (app *GatewayApp) chokeMonitor(chokeChan <-chan *choke.ChokeFrame) {
+	defer func() {
+		safety.SafeRecover(app.logger, "app.chokeMonitor")
+	}()
+
+	for cf := range chokeChan {
+		if cf == nil {
+			continue
+		}
+		if cf.ThreatLevel >= choke.ThreatCritical {
+			app.logger.Warn("CHOKE: threat=%s P=%.2fMPa dP/dt=%.2e Pa/s predicted=%.2fMPa tBreach=%v opening=%.3f override=%v",
+				cf.ThreatLevel,
+				cf.SafetyAssessment.CurrentPressure/1e6,
+				cf.PressureDerivative,
+				cf.PredictedPressure/1e6,
+				cf.TimeToBreach,
+				cf.CurrentOpening,
+				cf.OverrideSent)
 		}
 	}
 }
@@ -346,6 +399,12 @@ func (app *GatewayApp) printStats() {
 	app.logger.Info("Quality Range:        Min: %.4f, Max: %.4f",
 		solverStats.MinQuality, solverStats.MaxQuality)
 	app.logger.Info("Output Stats:         Frames: %d, Bytes: %d", framesWritten, bytesWritten)
+	if app.chokeInterceptor != nil {
+		chokeFrames, chokeOverrides, chokeLockdowns := app.chokeInterceptor.GetStats()
+		currentOpening := app.chokeInterceptor.GetCurrentOpening()
+		app.logger.Info("Choke Valve:          Frames: %d, Overrides: %d, Lockdowns: %d, Opening: %.3f",
+			chokeFrames, chokeOverrides, chokeLockdowns, currentOpening)
+	}
 	app.logger.Info("Safety Stats:         Total recovered panics: %d",
 		safety.TotalPanics())
 	app.logger.Info("----------------------------------------------------------")

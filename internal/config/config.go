@@ -48,12 +48,22 @@ type OutputConfig struct {
 	FlushInterval  int    `json:"flush_interval_ms"`
 }
 
+type ChokeConfig struct {
+	Enabled              bool    `json:"enabled"`
+	SafetyPressureLimit  float64 `json:"safety_pressure_limit_pa"`
+	DownstreamPressure   float64 `json:"downstream_pressure_pa"`
+	OverrideSlaveAddr    int     `json:"override_slave_addr"`
+	OverrideRegister     int     `json:"override_register"`
+	OverrideTargetAddr   string  `json:"override_target_addr"`
+}
+
 type Config struct {
 	TCP      TCPConfig       `json:"tcp"`
 	Serial   SerialPortConfig `json:"serial"`
 	Decoder  DecoderConfig   `json:"decoder"`
 	Solver   SolverConfig    `json:"solver"`
 	Output   OutputConfig    `json:"output"`
+	Choke    ChokeConfig     `json:"choke"`
 	LogLevel string          `json:"log_level"`
 	LogFile  string          `json:"log_file"`
 }
@@ -95,6 +105,14 @@ func DefaultConfig() *Config {
 			TCPServer:     true,
 			TCPListenAddr: ":8080",
 			FlushInterval: 100,
+		},
+		Choke: ChokeConfig{
+			Enabled:              true,
+			SafetyPressureLimit:  35.0e6,
+			DownstreamPressure:   101325.0,
+			OverrideSlaveAddr:    1,
+			OverrideRegister:     256,
+			OverrideTargetAddr:   "127.0.0.1:502",
 		},
 		LogLevel: "INFO",
 		LogFile:  "logs/gateway.log",
