@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,21 +17,36 @@ import (
 	"thermal-recovery-flow/internal/gateway"
 	"thermal-recovery-flow/internal/pipeline"
 	"thermal-recovery-flow/internal/protocol"
+	"thermal-recovery-flow/internal/safety"
 	"thermal-recovery-flow/pkg/logger"
 )
 
 type GatewayApp struct {
-	cfg        *config.Config
-	logger     *logger.Logger
-	tcpGateway *gateway.TCPGateway
-	serialGW   *gateway.SerialGateway
-	pipeline   *pipeline.Pipeline
-	solver     *driftflux.DriftFluxSolver
-	frameOut   *frame.FrameOutput
+	cfg         *config.Config
+	logger      *logger.Logger
+	tcpGateway  *gateway.TCPGateway
+	serialGW    *gateway.SerialGateway
+	pipeline    *pipeline.Pipeline
+	solver      *driftflux.DriftFluxSolver
+	frameOut    *frame.FrameOutput
 	statsTicker *time.Ticker
+	shutdown    atomic.Bool
 }
 
+var (
+	globalPanicCount uint64
+)
+
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			atomic.AddUint64(&globalPanicCount, 1)
+			fmt.Fprintf(os.Stderr, "FATAL PANIC in main: %v\nStack trace:\n%s\n", r, string(stack))
+			os.Exit(1)
+		}
+	}()
+
 	configPath := flag.String("config", "config.json", "Path to configuration file")
 	flag.Parse()
 
@@ -69,6 +86,11 @@ func main() {
 	}
 
 	app.waitForShutdown()
+
+	log.Info("========================================================")
+	log.Info("Gateway shutdown complete. Total global panics recovered: %d",
+		atomic.LoadUint64(&globalPanicCount)+safety.TotalPanics())
+	log.Info("========================================================")
 }
 
 func (app *GatewayApp) init() error {
@@ -106,6 +128,12 @@ func (app *GatewayApp) init() error {
 
 	if app.cfg.TCP.Enabled {
 		app.tcpGateway = gateway.NewTCPGateway(app.cfg.TCP.ListenAddr, app.pipeline.Input(), app.logger)
+		if app.cfg.TCP.MaxConnections > 0 {
+			app.tcpGateway.SetMaxConnections(app.cfg.TCP.MaxConnections)
+		}
+		if app.cfg.TCP.IdleTimeoutMs > 0 {
+			app.tcpGateway.SetIdleTimeout(time.Duration(app.cfg.TCP.IdleTimeoutMs) * time.Millisecond)
+		}
 	}
 
 	if app.cfg.Serial.Enabled {
@@ -137,7 +165,9 @@ func (app *GatewayApp) init() error {
 		app.serialGW = gateway.NewSerialGateway(serialCfg, app.pipeline.Input(), app.logger)
 	}
 
-	go app.handleErrors(errChan)
+	safety.SafeGo(app.logger, "app.handleErrors", func() {
+		app.handleErrors(errChan)
+	})
 
 	app.logger.Info("All components initialized successfully")
 	return nil
@@ -169,7 +199,9 @@ func (app *GatewayApp) start() error {
 	}
 
 	app.statsTicker = time.NewTicker(10 * time.Second)
-	go app.statsLoop()
+	safety.SafeGo(app.logger, "app.statsLoop", func() {
+		app.statsLoop()
+	})
 
 	app.logger.Info("========================================================")
 	app.logger.Info("Gateway started successfully")
@@ -180,6 +212,10 @@ func (app *GatewayApp) start() error {
 }
 
 func (app *GatewayApp) stop() {
+	if !app.shutdown.CompareAndSwap(false, true) {
+		return
+	}
+
 	app.logger.Info("Shutting down gateway...")
 
 	if app.statsTicker != nil {
@@ -187,29 +223,68 @@ func (app *GatewayApp) stop() {
 	}
 
 	if app.cfg.TCP.Enabled && app.tcpGateway != nil {
-		app.tcpGateway.Stop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during TCP gateway stop: %v", r)
+				}
+			}()
+			app.tcpGateway.Stop()
+		}()
 	}
 
 	if app.cfg.Serial.Enabled && app.serialGW != nil {
-		app.serialGW.Stop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during Serial gateway stop: %v", r)
+				}
+			}()
+			app.serialGW.Stop()
+		}()
 	}
 
 	if app.pipeline != nil {
-		app.pipeline.Stop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during pipeline stop: %v", r)
+				}
+			}()
+			app.pipeline.Stop()
+		}()
 	}
 
 	if app.solver != nil {
-		app.solver.Stop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during solver stop: %v", r)
+				}
+			}()
+			app.solver.Stop()
+		}()
 	}
 
 	if app.frameOut != nil {
-		app.frameOut.Stop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during frame output stop: %v", r)
+				}
+			}()
+			app.frameOut.Stop()
+		}()
 	}
 
 	app.logger.Info("Gateway shutdown complete")
 }
 
 func (app *GatewayApp) handleErrors(errChan <-chan error) {
+	defer func() {
+		safety.SafeRecover(app.logger, "app.handleErrors")
+	}()
+
 	for err := range errChan {
 		if err != nil {
 			app.logger.Debug("Processing error: %v", err)
@@ -218,8 +293,22 @@ func (app *GatewayApp) handleErrors(errChan <-chan error) {
 }
 
 func (app *GatewayApp) statsLoop() {
+	defer func() {
+		safety.SafeRecover(app.logger, "app.statsLoop")
+	}()
+
 	for range app.statsTicker.C {
-		app.printStats()
+		if app.shutdown.Load() {
+			return
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					app.logger.Debug("Recovered during stats print: %v", r)
+				}
+			}()
+			app.printStats()
+		}()
 	}
 }
 
@@ -234,15 +323,31 @@ func (app *GatewayApp) printStats() {
 	solverStats := app.solver.GetStats()
 	framesWritten, bytesWritten, tcpClients := app.frameOut.GetStats()
 
+	var serialFrames, serialBytes, serialErrors uint64
+	if app.serialGW != nil {
+		serialFrames, serialBytes, serialErrors = app.serialGW.GetStats()
+	}
+
+	decodedDropped, frameDropped, errDropped := app.pipeline.GetDropStats()
+
 	app.logger.Info("------------------- Gateway Statistics -------------------")
 	app.logger.Info("TCP Connections:      %d", tcpConnCount)
 	app.logger.Info("TCP Output Clients:   %d", tcpClients)
-	app.logger.Info("Decoder Stats:        Total: %d, Invalid: %d, Noise Filtered: %d", total, invalid, noise)
-	app.logger.Info("Channel Backlog:      Raw: %d, Decoded: %d, Frames: %d", rawLen, decodedLen, frameLen)
+	app.logger.Info("Decoder Stats:        Total: %d, Invalid: %d, Noise Filtered: %d",
+		total, invalid, noise)
+	app.logger.Info("Serial Stats:         Frames: %d, Bytes: %d, Errors: %d",
+		serialFrames, serialBytes, serialErrors)
+	app.logger.Info("Channel Backlog:      Raw: %d, Decoded: %d, Frames: %d",
+		rawLen, decodedLen, frameLen)
+	app.logger.Info("Drop Stats:           Decoded: %d, Frames: %d, Errors: %d",
+		decodedDropped, frameDropped, errDropped)
 	app.logger.Info("Solver Stats:         Total: %d, Failed: %d, Avg Iter: %.2f",
 		solverStats.TotalFrames, solverStats.FailedFrames, solverStats.AvgIterations)
-	app.logger.Info("Quality Range:        Min: %.4f, Max: %.4f", solverStats.MinQuality, solverStats.MaxQuality)
+	app.logger.Info("Quality Range:        Min: %.4f, Max: %.4f",
+		solverStats.MinQuality, solverStats.MaxQuality)
 	app.logger.Info("Output Stats:         Frames: %d, Bytes: %d", framesWritten, bytesWritten)
+	app.logger.Info("Safety Stats:         Total recovered panics: %d",
+		safety.TotalPanics())
 	app.logger.Info("----------------------------------------------------------")
 }
 
@@ -254,8 +359,15 @@ func (app *GatewayApp) waitForShutdown() {
 		sig := <-sigChan
 		switch sig {
 		case syscall.SIGHUP:
-			app.logger.Info("Received SIGHUP, reloading configuration...")
-			app.printStats()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						app.logger.Debug("Recovered during SIGHUP: %v", r)
+					}
+				}()
+				app.logger.Info("Received SIGHUP, reloading configuration...")
+				app.printStats()
+			}()
 		case syscall.SIGINT, syscall.SIGTERM:
 			app.logger.Info("Received signal %v, initiating shutdown...", sig)
 			return

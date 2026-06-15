@@ -4,9 +4,11 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"thermal-recovery-flow/internal/protocol"
+	"thermal-recovery-flow/internal/safety"
 	"thermal-recovery-flow/internal/thermo"
 	"thermal-recovery-flow/pkg/logger"
 )
@@ -31,7 +33,9 @@ type DriftFluxSolver struct {
 	wg          sync.WaitGroup
 	ctx         context.Context
 	cancel      context.CancelFunc
-	running     bool
+	running     atomic.Bool
+	outputDropped uint64
+	errorDropped  uint64
 }
 
 type SolverStats struct {
@@ -107,22 +111,31 @@ func NewDriftFluxSolver(config DriftFluxConfig, input <-chan *protocol.RawSensor
 }
 
 func (s *DriftFluxSolver) Start() {
-	s.running = true
+	if !s.running.CompareAndSwap(false, true) {
+		return
+	}
 	s.wg.Add(1)
-	go s.processLoop()
+	safety.SafeGoWG(s.logger, "driftflux.processLoop",
+		func() { s.wg.Done() },
+		func() { s.processLoop() })
 	s.logger.Info("Drift-Flux Solver started")
 }
 
 func (s *DriftFluxSolver) processLoop() {
-	defer s.wg.Done()
+	defer func() {
+		safety.SafeRecover(s.logger, "driftflux.processLoop")
+	}()
 
-	for s.running {
+	for s.running.Load() {
 		select {
 		case <-s.ctx.Done():
 			return
 		case sensorData, ok := <-s.inputChan:
 			if !ok {
 				return
+			}
+			if sensorData == nil {
+				continue
 			}
 
 			frame, err := s.Solve(sensorData)
@@ -133,7 +146,10 @@ func (s *DriftFluxSolver) processLoop() {
 
 				select {
 				case s.errorChan <- err:
+				case <-s.ctx.Done():
+					return
 				default:
+					atomic.AddUint64(&s.errorDropped, 1)
 				}
 				continue
 			}
@@ -152,8 +168,12 @@ func (s *DriftFluxSolver) processLoop() {
 
 			select {
 			case s.outputChan <- frame:
+			case <-s.ctx.Done():
+				return
 			default:
-				s.logger.Warn("Output channel full, dropping hydrodynamics frame")
+				atomic.AddUint64(&s.outputDropped, 1)
+				s.logger.Warn("Output channel full, dropping hydrodynamics frame (total: %d)",
+					atomic.LoadUint64(&s.outputDropped))
 			}
 		}
 	}
@@ -308,16 +328,16 @@ func (s *DriftFluxSolver) solveDriftFlux(eq *DriftFluxEquation) (x, alpha float6
 		alpha = (1.0-relax)*alpha + relax*alphaNew
 
 		if x < 0 {
-			x = 0
-			alpha = 0
-			converged = true
-			return
+			x = 0.001
 		}
 		if x > 1 {
-			x = 1
-			alpha = 1
-			converged = true
-			return
+			x = 0.999
+		}
+		if alpha < 0 {
+			alpha = 0.001
+		}
+		if alpha > 1 {
+			alpha = 0.999
 		}
 
 		if dx < s.config.Tolerance && dalpha < s.config.Tolerance {
@@ -374,10 +394,30 @@ func calculateMixtureViscosity(T float64, rhoL, rhoV, alpha float64) float64 {
 }
 
 func (s *DriftFluxSolver) Stop() {
-	s.running = false
+	if !s.running.CompareAndSwap(true, false) {
+		return
+	}
+
+	s.logger.Info("Drift-Flux Solver stopping...")
 	s.cancel()
-	s.wg.Wait()
-	s.logger.Info("Drift-Flux Solver stopped")
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		s.logger.Warn("Drift-Flux Solver shutdown timed out after 10s")
+	}
+
+	s.logger.Info("Drift-Flux Solver stopped. "+
+		"Total: %d, Failed: %d, OutputDropped: %d, ErrorDropped: %d",
+		s.stats.TotalFrames, s.stats.FailedFrames,
+		atomic.LoadUint64(&s.outputDropped),
+		atomic.LoadUint64(&s.errorDropped))
 }
 
 func (s *DriftFluxSolver) GetStats() SolverStats {

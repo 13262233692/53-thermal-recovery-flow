@@ -8,9 +8,11 @@ import (
 )
 
 type TCPConfig struct {
-	Enabled    bool   `json:"enabled"`
-	ListenAddr string `json:"listen_addr"`
-	BufferSize int    `json:"buffer_size"`
+	Enabled       bool   `json:"enabled"`
+	ListenAddr    string `json:"listen_addr"`
+	BufferSize    int    `json:"buffer_size"`
+	MaxConnections int  `json:"max_connections"`
+	IdleTimeoutMs int  `json:"idle_timeout_ms"`
 }
 
 type SerialPortConfig struct {
@@ -59,9 +61,11 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		TCP: TCPConfig{
-			Enabled:    true,
-			ListenAddr: ":502",
-			BufferSize: 10000,
+			Enabled:        true,
+			ListenAddr:     ":502",
+			BufferSize:     10000,
+			MaxConnections: 1024,
+			IdleTimeoutMs:  120000,
 		},
 		Serial: SerialPortConfig{
 			Enabled:   false,

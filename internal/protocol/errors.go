@@ -9,6 +9,8 @@ const (
 	ErrInsufficientData
 	ErrInvalidFunctionCode
 	ErrInvalidSlaveAddress
+	ErrFrameTooLong
+	ErrInvalidData
 )
 
 type DecodeError struct {
@@ -30,6 +32,10 @@ func (e *DecodeError) Error() string {
 		return "invalid function code: " + e.Detail
 	case ErrInvalidSlaveAddress:
 		return "invalid slave address: " + e.Detail
+	case ErrFrameTooLong:
+		return "frame too long: " + e.Detail
+	case ErrInvalidData:
+		return "invalid data: " + e.Detail
 	default:
 		return "decode error: " + e.Detail
 	}

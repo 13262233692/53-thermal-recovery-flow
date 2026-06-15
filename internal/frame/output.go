@@ -18,7 +18,13 @@ import (
 
 	"thermal-recovery-flow/internal/driftflux"
 	"thermal-recovery-flow/internal/protocol"
+	"thermal-recovery-flow/internal/safety"
 	"thermal-recovery-flow/pkg/logger"
+)
+
+const (
+	DefaultMaxOutputClients = 64
+	DefaultClientIdleTimeout = 300 * time.Second
 )
 
 type OutputFormat int
@@ -29,23 +35,35 @@ const (
 	FormatBinary
 )
 
+type tcpClient struct {
+	conn       net.Conn
+	remoteAddr string
+	closed     atomic.Bool
+	lastActive time.Time
+	mu         sync.Mutex
+}
+
 type FrameOutput struct {
-	config         OutputConfig
-	logger         *logger.Logger
-	inputChan      <-chan *driftflux.HydrodynamicsFrame
-	fileWriter     io.WriteCloser
-	csvWriter      *csv.Writer
-	tcpListener    net.Listener
-	tcpClients     map[net.Conn]bool
-	tcpMu          sync.RWMutex
-	wg             sync.WaitGroup
-	ctx            context.Context
-	cancel         context.CancelFunc
-	running        atomic.Bool
-	framesWritten  uint64
-	bytesWritten   uint64
-	flushTicker    *time.Ticker
-	flushInterval  time.Duration
+	config            OutputConfig
+	logger            *logger.Logger
+	inputChan         <-chan *driftflux.HydrodynamicsFrame
+	fileWriter        io.WriteCloser
+	csvWriter         *csv.Writer
+	fileClosed        atomic.Bool
+	tcpListener       net.Listener
+	tcpClients        map[*tcpClient]bool
+	tcpMu             sync.RWMutex
+	wg                sync.WaitGroup
+	ctx               context.Context
+	cancel            context.CancelFunc
+	running           atomic.Bool
+	stopped           atomic.Bool
+	framesWritten     uint64
+	bytesWritten      uint64
+	flushTicker       *time.Ticker
+	flushInterval     time.Duration
+	broadcastDropped  uint64
+	clientAcceptErrors uint64
 }
 
 type OutputConfig struct {
@@ -55,6 +73,8 @@ type OutputConfig struct {
 	TCPServer     bool
 	TCPListenAddr string
 	FlushInterval time.Duration
+	MaxClients    int
+	IdleTimeout   time.Duration
 }
 
 func ParseOutputFormat(format string) OutputFormat {
@@ -70,11 +90,17 @@ func ParseOutputFormat(format string) OutputFormat {
 
 func NewFrameOutput(cfg OutputConfig, input <-chan *driftflux.HydrodynamicsFrame, log *logger.Logger) *FrameOutput {
 	ctx, cancel := context.WithCancel(context.Background())
+	if cfg.MaxClients <= 0 {
+		cfg.MaxClients = DefaultMaxOutputClients
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultClientIdleTimeout
+	}
 	return &FrameOutput{
 		config:        cfg,
 		logger:        log,
 		inputChan:     input,
-		tcpClients:    make(map[net.Conn]bool),
+		tcpClients:    make(map[*tcpClient]bool),
 		ctx:           ctx,
 		cancel:        cancel,
 		flushInterval: cfg.FlushInterval,
@@ -90,9 +116,11 @@ func (o *FrameOutput) Start() error {
 	if !o.running.CompareAndSwap(false, true) {
 		return nil
 	}
+	o.stopped.Store(false)
 
 	if o.config.OutputFile != "" {
 		if err := o.openFile(); err != nil {
+			o.running.Store(false)
 			return err
 		}
 	}
@@ -104,24 +132,30 @@ func (o *FrameOutput) Start() error {
 	}
 
 	o.wg.Add(1)
-	go o.processLoop()
+	safety.SafeGoWG(o.logger, "frame.processLoop",
+		func() { o.wg.Done() },
+		func() { o.processLoop() })
 
 	if o.flushInterval > 0 {
 		o.flushTicker = time.NewTicker(o.flushInterval)
 		o.wg.Add(1)
-		go o.flushLoop()
+		safety.SafeGoWG(o.logger, "frame.flushLoop",
+			func() { o.wg.Done() },
+			func() { o.flushLoop() })
 	}
 
-	o.logger.Info("Frame output started (format: %v, file: %s, tcp: %v)",
-		o.config.Format, o.config.OutputFile, o.config.TCPServer)
+	o.logger.Info("Frame output started (format: %v, file: %s, tcp: %v, maxClients: %d)",
+		o.config.Format, o.config.OutputFile, o.config.TCPServer, o.config.MaxClients)
 
 	return nil
 }
 
 func (o *FrameOutput) openFile() error {
 	dir := filepath.Dir(o.config.OutputFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
 	}
 
 	f, err := os.OpenFile(o.config.OutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -130,6 +164,7 @@ func (o *FrameOutput) openFile() error {
 	}
 
 	o.fileWriter = f
+	o.fileClosed.Store(false)
 
 	if o.config.Format == FormatCSV {
 		o.csvWriter = csv.NewWriter(f)
@@ -143,12 +178,33 @@ func (o *FrameOutput) openFile() error {
 			"slave_address", "sensor_type",
 		}
 		if err := o.csvWriter.Write(header); err != nil {
+			o.safeCloseFile()
 			return err
 		}
 		o.csvWriter.Flush()
+		if err := o.csvWriter.Error(); err != nil {
+			o.safeCloseFile()
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (o *FrameOutput) safeCloseFile() {
+	if !o.fileClosed.CompareAndSwap(false, true) {
+		return
+	}
+	if o.csvWriter != nil {
+		o.csvWriter.Flush()
+		o.csvWriter = nil
+	}
+	if o.fileWriter != nil {
+		if err := o.fileWriter.Close(); err != nil {
+			o.logger.Debug("Error closing output file: %v", err)
+		}
+		o.fileWriter = nil
+	}
 }
 
 func (o *FrameOutput) startTCPServer() error {
@@ -158,13 +214,21 @@ func (o *FrameOutput) startTCPServer() error {
 	}
 
 	o.tcpListener = listener
-	o.logger.Info("Frame output TCP server listening on %s", o.config.TCPListenAddr)
+	o.logger.Info("Frame output TCP server listening on %s (maxClients=%d)",
+		o.config.TCPListenAddr, o.config.MaxClients)
 
-	go o.acceptTCPClients()
+	o.wg.Add(1)
+	safety.SafeGoWG(o.logger, "frame.acceptTCPClients",
+		func() { o.wg.Done() },
+		func() { o.acceptTCPClients() })
 	return nil
 }
 
 func (o *FrameOutput) acceptTCPClients() {
+	defer func() {
+		safety.SafeRecover(o.logger, "frame.acceptTCPClients")
+	}()
+
 	for o.running.Load() {
 		select {
 		case <-o.ctx.Done():
@@ -172,41 +236,127 @@ func (o *FrameOutput) acceptTCPClients() {
 		default:
 		}
 
+		if o.tcpListener == nil {
+			return
+		}
+
 		conn, err := o.tcpListener.Accept()
 		if err != nil {
-			if o.running.Load() {
-				o.logger.Error("TCP output accept error: %v", err)
+			if !o.running.Load() {
+				return
+			}
+			curErr := atomic.AddUint64(&o.clientAcceptErrors, 1)
+			o.logger.Debug("Frame output TCP accept error #%d: %v", curErr, err)
+			if curErr > 10 {
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-o.ctx.Done():
+					return
+				}
 			}
 			continue
 		}
+		atomic.StoreUint64(&o.clientAcceptErrors, 0)
 
-		o.logger.Info("New frame output client connected: %s", conn.RemoteAddr())
+		if o.GetClientCount() >= o.config.MaxClients {
+			o.logger.Warn("Max output clients (%d) reached, rejecting: %s",
+				o.config.MaxClients, conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
+		remoteAddr := conn.RemoteAddr().String()
+		o.logger.Info("New frame output client connected: %s", remoteAddr)
+
+		client := &tcpClient{
+			conn:       conn,
+			remoteAddr: remoteAddr,
+			lastActive: time.Now(),
+		}
 
 		o.tcpMu.Lock()
-		o.tcpClients[conn] = true
+		o.tcpClients[client] = true
 		o.tcpMu.Unlock()
 
-		go o.monitorTCPClient(conn)
+		o.wg.Add(1)
+		safety.SafeGoWG(o.logger, fmt.Sprintf("frame.monitorClient[%s]", remoteAddr),
+			func() { o.wg.Done() },
+			func() { o.monitorTCPClient(client) })
 	}
 }
 
-func (o *FrameOutput) monitorTCPClient(conn net.Conn) {
+func (o *FrameOutput) monitorTCPClient(client *tcpClient) {
+	defer func() {
+		safety.SafeRecover(o.logger, fmt.Sprintf("frame.monitorClient[%s]", client.remoteAddr))
+		o.cleanupClient(client)
+	}()
+
 	buf := make([]byte, 1024)
 	for o.running.Load() {
-		_, err := conn.Read(buf)
+		select {
+		case <-o.ctx.Done():
+			return
+		default:
+		}
+
+		if o.config.IdleTimeout > 0 {
+			if err := client.conn.SetReadDeadline(time.Now().Add(o.config.IdleTimeout)); err != nil {
+				return
+			}
+		} else {
+			if err := client.conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				return
+			}
+		}
+
+		_, err := client.conn.Read(buf)
 		if err != nil {
-			o.tcpMu.Lock()
-			delete(o.tcpClients, conn)
-			o.tcpMu.Unlock()
-			conn.Close()
-			o.logger.Info("Frame output client disconnected: %s", conn.RemoteAddr())
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				idleFor := time.Since(client.lastActive)
+				if o.config.IdleTimeout > 0 && idleFor > o.config.IdleTimeout {
+					o.logger.Info("Frame output client %s idle for %v, disconnecting",
+						client.remoteAddr, idleFor)
+					return
+				}
+				continue
+			}
+			if o.running.Load() {
+				o.logger.Debug("Frame output client %s read error: %v", client.remoteAddr, err)
+			}
 			return
 		}
+
+		client.mu.Lock()
+		client.lastActive = time.Now()
+		client.mu.Unlock()
 	}
+}
+
+func (o *FrameOutput) cleanupClient(client *tcpClient) {
+	if client == nil {
+		return
+	}
+	if !client.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	o.tcpMu.Lock()
+	delete(o.tcpClients, client)
+	o.tcpMu.Unlock()
+
+	if client.conn != nil {
+		if err := client.conn.Close(); err != nil {
+			o.logger.Debug("Error closing frame output client %s: %v", client.remoteAddr, err)
+		}
+	}
+
+	o.logger.Info("Frame output client disconnected: %s", client.remoteAddr)
 }
 
 func (o *FrameOutput) processLoop() {
-	defer o.wg.Done()
+	defer func() {
+		safety.SafeRecover(o.logger, "frame.processLoop")
+	}()
 
 	for o.running.Load() {
 		select {
@@ -216,6 +366,9 @@ func (o *FrameOutput) processLoop() {
 			if !ok {
 				return
 			}
+			if frame == nil {
+				continue
+			}
 
 			data, err := o.serializeFrame(frame)
 			if err != nil {
@@ -223,18 +376,27 @@ func (o *FrameOutput) processLoop() {
 				continue
 			}
 
-			if o.fileWriter != nil {
-				if _, err := o.fileWriter.Write(data); err != nil {
-					o.logger.Error("Failed to write to file: %v", err)
-				} else {
-					atomic.AddUint64(&o.framesWritten, 1)
-					atomic.AddUint64(&o.bytesWritten, uint64(len(data)))
-				}
+			if data != nil && len(data) > 0 {
+				o.writeToFile(data)
 			}
 
 			o.broadcastToTCPClients(data)
 		}
 	}
+}
+
+func (o *FrameOutput) writeToFile(data []byte) {
+	if o.fileClosed.Load() || o.fileWriter == nil {
+		return
+	}
+
+	if _, err := o.fileWriter.Write(data); err != nil {
+		o.logger.Error("Failed to write to file: %v", err)
+		o.safeCloseFile()
+		return
+	}
+	atomic.AddUint64(&o.framesWritten, 1)
+	atomic.AddUint64(&o.bytesWritten, uint64(len(data)))
 }
 
 func (o *FrameOutput) serializeFrame(frame *driftflux.HydrodynamicsFrame) ([]byte, error) {
@@ -318,6 +480,10 @@ func (o *FrameOutput) serializeJSON(frame *driftflux.HydrodynamicsFrame) ([]byte
 }
 
 func (o *FrameOutput) serializeCSV(frame *driftflux.HydrodynamicsFrame) ([]byte, error) {
+	if o.csvWriter == nil {
+		return nil, nil
+	}
+
 	record := []string{
 		frame.Timestamp.Format(time.RFC3339Nano),
 		strconv.FormatUint(frame.HighSpeedTime, 10),
@@ -342,10 +508,8 @@ func (o *FrameOutput) serializeCSV(frame *driftflux.HydrodynamicsFrame) ([]byte,
 		strconv.FormatUint(uint64(frame.SensorType), 10),
 	}
 
-	if o.csvWriter != nil {
-		if err := o.csvWriter.Write(record); err != nil {
-			return nil, err
-		}
+	if err := o.csvWriter.Write(record); err != nil {
+		return nil, err
 	}
 
 	return nil, nil
@@ -393,30 +557,58 @@ func (o *FrameOutput) serializeBinary(frame *driftflux.HydrodynamicsFrame) ([]by
 }
 
 func (o *FrameOutput) broadcastToTCPClients(data []byte) {
-	o.tcpMu.RLock()
-	defer o.tcpMu.RUnlock()
+	if len(data) == 0 {
+		return
+	}
 
-	for conn := range o.tcpClients {
-		if _, err := conn.Write(data); err != nil {
-			o.logger.Debug("Failed to write to TCP client %s: %v", conn.RemoteAddr(), err)
+	o.tcpMu.RLock()
+	clients := make([]*tcpClient, 0, len(o.tcpClients))
+	for c := range o.tcpClients {
+		clients = append(clients, c)
+	}
+	o.tcpMu.RUnlock()
+
+	for _, client := range clients {
+		if client.closed.Load() {
+			continue
+		}
+		client.mu.Lock()
+		_, err := client.conn.Write(data)
+		if err == nil {
+			client.lastActive = time.Now()
+		}
+		client.mu.Unlock()
+		if err != nil {
+			atomic.AddUint64(&o.broadcastDropped, 1)
+			o.logger.Debug("Failed to broadcast to TCP client %s: %v", client.remoteAddr, err)
+			o.cleanupClient(client)
 		}
 	}
 }
 
 func (o *FrameOutput) flushLoop() {
-	defer o.wg.Done()
+	defer func() {
+		safety.SafeRecover(o.logger, "frame.flushLoop")
+	}()
 
 	for o.running.Load() {
 		select {
 		case <-o.ctx.Done():
 			return
 		case <-o.flushTicker.C:
-			if o.csvWriter != nil {
-				o.csvWriter.Flush()
-			}
-			if o.fileWriter != nil {
-				if f, ok := o.fileWriter.(*os.File); ok {
-					f.Sync()
+			if !o.fileClosed.Load() {
+				if o.csvWriter != nil {
+					o.csvWriter.Flush()
+					if err := o.csvWriter.Error(); err != nil {
+						o.logger.Error("CSV flush error: %v", err)
+					}
+				}
+				if o.fileWriter != nil {
+					if f, ok := o.fileWriter.(*os.File); ok {
+						if err := f.Sync(); err != nil {
+							o.logger.Debug("File sync error: %v", err)
+						}
+					}
 				}
 			}
 		}
@@ -427,6 +619,11 @@ func (o *FrameOutput) Stop() {
 	if !o.running.CompareAndSwap(true, false) {
 		return
 	}
+	if !o.stopped.CompareAndSwap(false, true) {
+		return
+	}
+
+	o.logger.Info("Frame output stopping...")
 
 	o.cancel()
 
@@ -435,28 +632,49 @@ func (o *FrameOutput) Stop() {
 	}
 
 	if o.tcpListener != nil {
-		o.tcpListener.Close()
+		if err := o.tcpListener.Close(); err != nil {
+			o.logger.Debug("Error closing TCP listener: %v", err)
+		}
+		o.tcpListener = nil
 	}
 
 	o.tcpMu.Lock()
-	for conn := range o.tcpClients {
-		conn.Close()
+	clients := make([]*tcpClient, 0, len(o.tcpClients))
+	for c := range o.tcpClients {
+		clients = append(clients, c)
 	}
-	o.tcpClients = nil
 	o.tcpMu.Unlock()
 
-	o.wg.Wait()
-
-	if o.csvWriter != nil {
-		o.csvWriter.Flush()
+	for _, c := range clients {
+		o.cleanupClient(c)
 	}
 
-	if o.fileWriter != nil {
-		o.fileWriter.Close()
+	done := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		o.logger.Warn("Frame output shutdown timed out after 10s")
 	}
 
-	o.logger.Info("Frame output stopped. Frames written: %d, bytes: %d",
-		atomic.LoadUint64(&o.framesWritten), atomic.LoadUint64(&o.bytesWritten))
+	o.safeCloseFile()
+
+	o.logger.Info("Frame output stopped. "+
+		"Frames written: %d, bytes: %d, broadcast dropped: %d, accept errors: %d",
+		atomic.LoadUint64(&o.framesWritten),
+		atomic.LoadUint64(&o.bytesWritten),
+		atomic.LoadUint64(&o.broadcastDropped),
+		atomic.LoadUint64(&o.clientAcceptErrors))
+}
+
+func (o *FrameOutput) GetClientCount() int {
+	o.tcpMu.RLock()
+	defer o.tcpMu.RUnlock()
+	return len(o.tcpClients)
 }
 
 func (o *FrameOutput) GetStats() (frames, bytes uint64, clients int) {

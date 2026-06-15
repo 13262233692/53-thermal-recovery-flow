@@ -9,20 +9,32 @@ import (
 	"sync/atomic"
 	"time"
 
+	"thermal-recovery-flow/internal/safety"
 	"thermal-recovery-flow/pkg/logger"
 )
 
+const (
+	DefaultMaxConnections  = 1024
+	DefaultIdleTimeout     = 120 * time.Second
+	DefaultReadBufferSize  = 4096
+	AcceptBackoffThreshold = 10
+	AcceptBackoffDuration  = 100 * time.Millisecond
+)
+
 type TCPGateway struct {
-	listener    net.Listener
-	addr        string
-	connections map[string]*TCPConnection
-	mu          sync.RWMutex
-	wg          sync.WaitGroup
-	ctx         context.Context
-	cancel      context.CancelFunc
-	running     atomic.Bool
-	RawDataChan chan<- []byte
-	logger      *logger.Logger
+	listener       net.Listener
+	addr           string
+	maxConnections int
+	idleTimeout    time.Duration
+	connections    map[string]*TCPConnection
+	mu             sync.RWMutex
+	wg             sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	running        atomic.Bool
+	RawDataChan    chan<- []byte
+	logger         *logger.Logger
+	acceptErrors   uint64
 }
 
 type TCPConnection struct {
@@ -30,17 +42,32 @@ type TCPConnection struct {
 	remoteAddr string
 	lastActive time.Time
 	mu         sync.Mutex
+	closed     atomic.Bool
 }
 
 func NewTCPGateway(addr string, rawDataChan chan<- []byte, log *logger.Logger) *TCPGateway {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TCPGateway{
-		addr:        addr,
-		connections: make(map[string]*TCPConnection),
-		ctx:         ctx,
-		cancel:      cancel,
-		RawDataChan: rawDataChan,
-		logger:      log,
+		addr:           addr,
+		maxConnections: DefaultMaxConnections,
+		idleTimeout:    DefaultIdleTimeout,
+		connections:    make(map[string]*TCPConnection),
+		ctx:            ctx,
+		cancel:         cancel,
+		RawDataChan:    rawDataChan,
+		logger:         log,
+	}
+}
+
+func (g *TCPGateway) SetMaxConnections(n int) {
+	if n > 0 {
+		g.maxConnections = n
+	}
+}
+
+func (g *TCPGateway) SetIdleTimeout(d time.Duration) {
+	if d > 0 {
+		g.idleTimeout = d
 	}
 }
 
@@ -53,14 +80,21 @@ func (g *TCPGateway) Start() error {
 	g.listener = listener
 	g.running.Store(true)
 
-	g.logger.Info("TCP Gateway started on %s", g.addr)
+	g.logger.Info("TCP Gateway started on %s (maxConn=%d, idleTimeout=%v)",
+		g.addr, g.maxConnections, g.idleTimeout)
 
-	go g.acceptConnections()
+	safety.SafeGo(g.logger, "tcp.acceptConnections", func() {
+		g.acceptConnections()
+	})
 
 	return nil
 }
 
 func (g *TCPGateway) acceptConnections() {
+	defer func() {
+		safety.SafeRecover(g.logger, "tcp.acceptConnections")
+	}()
+
 	for g.running.Load() {
 		select {
 		case <-g.ctx.Done():
@@ -70,9 +104,27 @@ func (g *TCPGateway) acceptConnections() {
 
 		conn, err := g.listener.Accept()
 		if err != nil {
-			if g.running.Load() {
-				g.logger.Error("Failed to accept connection: %v", err)
+			if !g.running.Load() {
+				return
 			}
+			curErr := atomic.AddUint64(&g.acceptErrors, 1)
+			g.logger.Error("TCP accept error #%d: %v", curErr, err)
+			if curErr > AcceptBackoffThreshold {
+				g.logger.Warn("Too many accept errors, backing off %v", AcceptBackoffDuration)
+				select {
+				case <-time.After(AcceptBackoffDuration):
+				case <-g.ctx.Done():
+					return
+				}
+			}
+			continue
+		}
+		atomic.StoreUint64(&g.acceptErrors, 0)
+
+		if g.GetConnectionCount() >= g.maxConnections {
+			g.logger.Warn("Max connections (%d) reached, rejecting: %s",
+				g.maxConnections, conn.RemoteAddr())
+			conn.Close()
 			continue
 		}
 
@@ -90,24 +142,20 @@ func (g *TCPGateway) acceptConnections() {
 		g.mu.Unlock()
 
 		g.wg.Add(1)
-		go g.handleConnection(tcpConn)
+		safety.SafeGoWG(g.logger, fmt.Sprintf("tcp.handleConnection[%s]", remoteAddr),
+			func() { g.wg.Done() },
+			func() { g.handleConnection(tcpConn) })
 	}
 }
 
 func (g *TCPGateway) handleConnection(tcpConn *TCPConnection) {
 	defer func() {
-		g.wg.Done()
-		tcpConn.conn.Close()
-
-		g.mu.Lock()
-		delete(g.connections, tcpConn.remoteAddr)
-		g.mu.Unlock()
-
-		g.logger.Info("Connection closed from %s", tcpConn.remoteAddr)
+		safety.SafeRecover(g.logger, fmt.Sprintf("tcp.handleConnection[%s]", tcpConn.remoteAddr))
+		g.cleanupConnection(tcpConn)
 	}()
 
 	reader := bufio.NewReader(tcpConn.conn)
-	buffer := make([]byte, 4096)
+	buffer := make([]byte, DefaultReadBufferSize)
 
 	for g.running.Load() {
 		select {
@@ -116,13 +164,32 @@ func (g *TCPGateway) handleConnection(tcpConn *TCPConnection) {
 		default:
 		}
 
-		tcpConn.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if g.idleTimeout > 0 {
+			if err := tcpConn.conn.SetReadDeadline(time.Now().Add(g.idleTimeout)); err != nil {
+				g.logger.Debug("SetReadDeadline error for %s: %v", tcpConn.remoteAddr, err)
+				return
+			}
+		} else {
+			if err := tcpConn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				return
+			}
+		}
+
 		n, err := reader.Read(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				tcpConn.mu.Lock()
+				idleFor := time.Since(tcpConn.lastActive)
+				tcpConn.mu.Unlock()
+				if g.idleTimeout > 0 && idleFor > g.idleTimeout {
+					g.logger.Info("Connection %s idle for %v, closing", tcpConn.remoteAddr, idleFor)
+					return
+				}
 				continue
 			}
-			g.logger.Error("Read error from %s: %v", tcpConn.remoteAddr, err)
+			if g.running.Load() {
+				g.logger.Debug("Read error from %s: %v", tcpConn.remoteAddr, err)
+			}
 			return
 		}
 
@@ -136,6 +203,8 @@ func (g *TCPGateway) handleConnection(tcpConn *TCPConnection) {
 
 			select {
 			case g.RawDataChan <- data:
+			case <-g.ctx.Done():
+				return
 			default:
 				g.logger.Warn("Raw data channel full, dropping %d bytes from %s", n, tcpConn.remoteAddr)
 			}
@@ -143,25 +212,67 @@ func (g *TCPGateway) handleConnection(tcpConn *TCPConnection) {
 	}
 }
 
+func (g *TCPGateway) cleanupConnection(tcpConn *TCPConnection) {
+	if tcpConn == nil {
+		return
+	}
+	if !tcpConn.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	if tcpConn.conn != nil {
+		if err := tcpConn.conn.Close(); err != nil {
+			g.logger.Debug("Error closing connection %s: %v", tcpConn.remoteAddr, err)
+		}
+	}
+
+	g.mu.Lock()
+	delete(g.connections, tcpConn.remoteAddr)
+	g.mu.Unlock()
+
+	g.logger.Info("Connection closed from %s", tcpConn.remoteAddr)
+}
+
 func (g *TCPGateway) Stop() {
 	if !g.running.CompareAndSwap(true, false) {
 		return
 	}
 
+	g.logger.Info("TCP Gateway stopping...")
+
 	g.cancel()
 
 	if g.listener != nil {
-		g.listener.Close()
+		if err := g.listener.Close(); err != nil {
+			g.logger.Debug("Error closing listener: %v", err)
+		}
 	}
 
 	g.mu.RLock()
+	conns := make([]*TCPConnection, 0, len(g.connections))
 	for _, conn := range g.connections {
-		conn.conn.Close()
+		conns = append(conns, conn)
 	}
 	g.mu.RUnlock()
 
-	g.wg.Wait()
-	g.logger.Info("TCP Gateway stopped")
+	for _, tcpConn := range conns {
+		g.cleanupConnection(tcpConn)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		g.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		g.logger.Warn("TCP Gateway shutdown timed out after 10s")
+	}
+
+	g.logger.Info("TCP Gateway stopped, total accept errors: %d",
+		atomic.LoadUint64(&g.acceptErrors))
 }
 
 func (g *TCPGateway) GetConnectionCount() int {
@@ -172,17 +283,28 @@ func (g *TCPGateway) GetConnectionCount() int {
 
 func (g *TCPGateway) Broadcast(data []byte) (int, error) {
 	g.mu.RLock()
-	defer g.mu.RUnlock()
+	conns := make([]*TCPConnection, 0, len(g.connections))
+	for _, conn := range g.connections {
+		conns = append(conns, conn)
+	}
+	g.mu.RUnlock()
 
 	count := 0
-	for _, conn := range g.connections {
-		conn.mu.Lock()
-		_, err := conn.conn.Write(data)
-		conn.mu.Unlock()
-		if err != nil {
-			g.logger.Error("Failed to broadcast to %s: %v", conn.remoteAddr, err)
+	for _, tcpConn := range conns {
+		if tcpConn.closed.Load() {
 			continue
 		}
+		tcpConn.mu.Lock()
+		_, err := tcpConn.conn.Write(data)
+		tcpConn.mu.Unlock()
+		if err != nil {
+			g.logger.Debug("Failed to broadcast to %s: %v", tcpConn.remoteAddr, err)
+			g.cleanupConnection(tcpConn)
+			continue
+		}
+		tcpConn.mu.Lock()
+		tcpConn.lastActive = time.Now()
+		tcpConn.mu.Unlock()
 		count++
 	}
 
